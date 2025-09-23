@@ -105,3 +105,32 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sleep(void)
+{
+  int n;
+  uint ticks0;
+
+  // Get argument - no error checking since argint doesn't return value
+  argint(0, &n);
+
+  // Validate the sleep time
+  if(n < 0)
+    return -1;
+
+  acquire(&tickslock);
+  ticks0 = ticks;
+
+  // Sleep until the required number of ticks have passed
+  while(ticks - ticks0 < n){
+    if(myproc()->killed){
+      release(&tickslock);
+      return -1;
+    }
+    sleep(&ticks, &tickslock);
+  }
+
+  release(&tickslock);
+  return 0;
+}
