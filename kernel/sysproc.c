@@ -7,6 +7,7 @@
 #include "proc.h"
 #include "vm.h"
 
+
 uint64
 sys_exit(void)
 {
@@ -104,4 +105,26 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+
+uint64
+sys_interpose(void) //interpose system call defination
+{
+  int mask;
+  char path[MAXPATH];
+  struct proc *p = myproc();
+  
+  // Get arguments from user space
+   // Get arguments from user space - argint and argstr are void
+  argint(0, &mask);
+  argstr(1, path, MAXPATH);
+  
+  // Store the mask and allowed path in current process
+  p->mask = mask;
+  
+  // Copy the allowed path (safe copy using strncpy)
+  safestrcpy(p->allowed_path, path, MAXPATH);
+  
+  return 0;
 }

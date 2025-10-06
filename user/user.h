@@ -24,6 +24,7 @@ int getpid(void);
 char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
+int interpose(int mask, char* path); //Our new system call interpose with it arguments
 
 // ulib.c
 int stat(const char*, struct stat*);

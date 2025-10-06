@@ -146,6 +146,10 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // SANDBOX INITIALIZATION
+  p->mask = 0;                    // No restrictions by default
+  p->allowed_path[0] = '\0';      // Empty allowed path
+
   return p;
 }
 
@@ -286,6 +290,10 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+
+  // SANDBOX INHERITANCE - Copy mask and allowed path
+  np->mask = p->mask;
+  safestrcpy(np->allowed_path, p->allowed_path, MAXPATH);
 
   pid = np->pid;
 

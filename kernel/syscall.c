@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "defs.h"
 
+
 // Fetch the uint64 at addr from the current process.
 int
 fetchaddr(uint64 addr, uint64 *ip)
@@ -101,6 +102,7 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_interpose(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,7 +128,26 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_interpose] sys_interpose,
 };
+
+
+// Helper function to check if a path is allowed
+int is_path_allowed(struct proc *p, uint64 path_addr) {
+  char path[MAXPATH];
+  
+  // If allowed path is empty or "-", no exceptions
+  if(strlen(p->allowed_path) == 0 || strncmp(p->allowed_path, "-", MAXPATH) == 0)
+    return 0;
+  
+  // Copy path from user space
+  if(fetchstr(path_addr, path, MAXPATH) < 0)
+    return 0;
+  
+  // Check if path matches the allowed path
+  return (strncmp(path, p->allowed_path, MAXPATH) == 0);
+}
+
 
 void
 syscall(void)
@@ -134,10 +155,39 @@ syscall(void)
   int num;
   struct proc *p = myproc();
 
-  num = p->trapframe->a7;
+  num = p->trapframe->a7;  //Original Line
+// Introducing  a bug to our code to cause a crash
+
+  //num = * (int *) 0; // Bugged line
+//This line is trying to read an integer from memory address 0(Invalid Address) 
+
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
+
+  // Check if this system call is restricted by the sandbox mask
+    if(p->mask & (1 << num)) {
+      // Special handling for open and exec with path exceptions
+      if(num == SYS_open || num == SYS_exec) {
+        // Get the path argument (first argument for both open and exec)
+        uint64 path_addr;
+         argaddr(0, &path_addr);   
+      
+          // Check if the path matches the allowed path
+          if(is_path_allowed(p, path_addr)) {
+            // Path is allowed - execute the system call normally
+            p->trapframe->a0 = syscalls[num]();
+            return;
+          
+        }
+      }
+      
+      // System call is restricted and no exception applies - return error
+      p->trapframe->a0 = -1;
+      return;
+    }
+    
+
     p->trapframe->a0 = syscalls[num]();
   } else {
     printf("%d %s: unknown sys call %d\n",

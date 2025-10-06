@@ -1,0 +1,14 @@
+A1: usertrap() called syscall()
+
+A2: The value is 0xf (decimal 15). This represents system call number 15, which is SYS_open - the system call to open
+a file.
+
+A3: The previous mode was User mode. This is determined by the SPP (Supervisor Previous Privilege) bit in the
+sstatus register (0x200000022) being 0 which is the 8th bit.
+
+A4: The assembly instruction is lw a5,0(zero). Register a5 corresponds to the variable num.
+
+A5: The kernel crashes because it attempts to read from memory address 0 as in bugged instruction (*(int *) 0).
+Address 0 is not mapped in the kernel's address space, this causes a load page fault, indicated by scause=0xd.
+The faulting address is given by stval=0x0.
+
