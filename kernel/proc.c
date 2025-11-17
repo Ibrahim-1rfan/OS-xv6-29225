@@ -131,6 +131,15 @@ found:
     release(&p->lock);
     return 0;
   }
+ 
+ // Allocate USYSCALL page
+if((p->usyscall = (struct usyscall *)kalloc()) == 0){
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+p->usyscall->pid = p->pid;
+
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -155,6 +164,10 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  if(p->usyscall){
+  kfree((void*)p->usyscall);
+  p->usyscall = 0;
+}
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -200,6 +213,15 @@ proc_pagetable(struct proc *p)
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
     uvmfree(pagetable, 0);
     return 0;
+  } 
+
+   // map the USYSCALL page
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+            (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
+  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmfree(pagetable, 0);
+  return 0;
   }
 
   return pagetable;
@@ -212,6 +234,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -241,8 +264,28 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    uint64 newsz = sz + n;
+    
+    // For now, let's just use the regular uvmalloc
+    // We'll add superpage support incrementally
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
+    }
+    
+    // After successful allocation, try to convert to superpages
+    if(n >= SUPERPGSIZE) {
+      uint64 super_start = SUPERPGROUNDUP(sz - n);  // Start of new allocation
+      uint64 super_end = SUPERPGROUNDDOWN(newsz);
+      
+      if(super_end > super_start) {
+        printf("Attempting to create superpages from 0x%lx to 0x%lx\n", super_start, super_end);
+        
+        // For each 2MB-aligned region in our new allocation
+        for(uint64 va = super_start; va < super_end; va += SUPERPGSIZE) {
+          printf("Would create superpage at va=0x%lx\n", va);
+          // For now, just log - we'll implement this later
+        }
+      }
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
@@ -250,6 +293,13 @@ growproc(int n)
   p->sz = sz;
   return 0;
 }
+
+
+
+
+
+
+
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.

@@ -1,0 +1,41 @@
+Q1. PGTBL_TEST
+
+Definations:
+va: virtual address
+pte: page table entry
+pa: the physical address
+perm : the 12 permission bits with the first 5 being valid, read, 
+write exec and user_mode
+
+
+PAGES EXPLANATION:
+First 5 Pages
+- va 0x0: Code section of the program
+- Permissions: Readable, Writable, Executable, User
+
+- va 0x1000: More code or program data
+- Permissions: Readable, Writable, Executable, User
+
+- va 0x2000: Additional code/data section
+- Permissions: Readable, Writable, Executable, User
+
+- va 0x3000: Kernel-accessible memory page
+- Permissions: Readable, Writable, Executable, Kernel-only
+
+- va 0x4000: Data section (global variables)
+- Permissions: Readable, Writable, Not Executable, User
+
+Unmapped Pages (from output page 6 till 17)
+- va 0x5000 to va 0x3FFFFFFC000: Unused/unmapped memory
+- Permissions: No access - will cause segmentation fault
+
+Last 3 Pages
+-va 0x3FFFFFFD000: Unmapped guard page below the stack
+-Permissions: No access - prevents stack overflow, 
+we got error because of it being accessed
+ 
+- va 0x3FFFFFFE000: User stack space
+- Permissions: Readable, Writable, Not Executable, User
+
+- va 0x3FFFFFFF000: Trampoline page (for system calls)
+- Permissions: Readable, Not Writable, Executable, User

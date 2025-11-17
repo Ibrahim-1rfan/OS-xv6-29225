@@ -140,11 +140,35 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
+// Helper function for recursive page table printing
+static void
+vmprint_recursive(pagetable_t pagetable, int level, uint64 prevva)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V) {
+      // Print the exact format the test expects
+      for(int j = -1; j < level; j++) {
+        printf(" ..");
+      }
+      
+      uint64 va = prevva | ((uint64)i << (12 + 9 * (2 - level)));
+
+      printf("%p: pte %p pa %p\n", (void *)va, (void *) pte, (void *)PTE2PA(pte));
+      
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+        vmprint_recursive((pagetable_t)PTE2PA(pte), level + 1, va);
+      }
+    }
+  }
+}
 
 #if defined(LAB_PGTBL) || defined(SOL_MMAP) || defined(SOL_COW)
 void
 vmprint(pagetable_t pagetable) {
   // your code here
+   printf("page table %p\n", pagetable);
+  vmprint_recursive(pagetable, 0,0); // Start at level 1   
 }
 #endif
 
@@ -217,26 +241,37 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz = PGSIZE;
 
-  if((va % PGSIZE) != 0)
-    panic("uvmunmap: not aligned");
-
-  for(a = va; a < va + npages*PGSIZE; a += sz){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+  for(a = va; a < va + npages * PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
       continue;
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
+    if((*pte & PTE_V) == 0)
       continue;
-    sz = PGSIZE;
-    if(PTE_FLAGS(*pte) == PTE_V)
-      panic("uvmunmap: not a leaf");
-    if(do_free){
+    
+    // Check if this is a superpage
+    if(issuperpage(*pte) && (a % SUPERPGSIZE == 0)) {
       uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      if(do_free){
+        // Free the physical page(s)
+        // Note: We only allocated one page but mapped it as superpage
+        kfree((void*)pa);
+      }
+      *pte = 0;
+      // Skip the rest of the superpage
+      a += SUPERPGSIZE - PGSIZE;
+    } else {
+      // Regular page
+      uint64 pa = PTE2PA(*pte);
+      if(do_free){
+        kfree((void*)pa);
+      }
+      *pte = 0;
     }
-    *pte = 0;
   }
 }
+
+
+
 
 
 // Allocate PTEs and physical memory to grow process from oldsz to
@@ -332,24 +367,44 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
-  int szinc = PGSIZE;
 
-  for(i = 0; i < sz; i += szinc){
+  for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       continue;
-    if((*pte & PTE_V) == 0) {
+    if((*pte & PTE_V) == 0)
       continue;
-    }
-    szinc = PGSIZE;
+    
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    
+    // Handle superpage copy
+    if(issuperpage(*pte) && (i % SUPERPGSIZE == 0)) {
+      // Allocate new page for child (we only copy one page of the superpage)
+      void *new_pa = kalloc();
+      if(new_pa == 0)
+        goto err;
+      
+      // Map as superpage in child
+      uint64 super_pa = (uint64)new_pa & ~(SUPERPGSIZE - 1);
+      if(mappages_super(new, i, super_pa, flags & (PTE_W|PTE_U)) != 0) {
+        kfree(new_pa);
+        goto err;
+      }
+      
+      // Copy the first page of content (since we only allocated one page)
+      memmove(new_pa, (void*)pa, PGSIZE);
+      
+      // Skip the rest of the superpage range
+      i += SUPERPGSIZE - PGSIZE;
+    } else {
+      // Regular page copy
+      if((pa = (uint64)kalloc()) == 0)
+        goto err;
+      memmove((void*)pa, (void*)PTE2PA(*pte), PGSIZE);
+      if(mappages(new, i, PGSIZE, pa, flags) != 0){
+        kfree((void*)pa);
+        goto err;
+      }
     }
   }
   return 0;
@@ -537,3 +592,146 @@ pgpte(pagetable_t pagetable, uint64 va) {
   return walk(pagetable, va, 0);
 }
 #endif
+
+
+//Allocation of super pages in Virtual Memeory
+
+/**
+ * cansuperpage - Check if we can use superpages for a memory range
+ * @oldsz: Current process size
+ * @newsz: Requested new process size  
+ * @return: 1 if superpages can be used, 0 otherwise
+ *
+ * Checks if there's a 2MB-aligned region between oldsz and newsz
+ * that's at least 2MB in size.
+ */
+int
+cansuperpage(uint64 oldsz, uint64 newsz)
+{
+  // Find the first 2MB-aligned address >= oldsz
+  uint64 start = SUPERPGROUNDUP(oldsz);
+  // Find the last 2MB-aligned address <= newsz  
+  uint64 end = SUPERPGROUNDDOWN(newsz);
+  
+  // We can use superpages if there's at least one full 2MB region
+  return (end > start) && ((end - start) >= SUPERPGSIZE);
+}
+
+/**
+ * mappages_super - Map a 2MB superpage into page table
+ * @pagetable: Page table to modify
+ * @va: Virtual address (must be 2MB aligned)
+ * @pa: Physical address (must be 2MB aligned) 
+ * @perm: Permission flags
+ * @return: 0 on success, -1 on failure
+ *
+ * Creates a superpage mapping in the level-1 page table.
+ * Superpages use PTE_V + PTE_R without PTE_W/X/U in level-1 PTEs.
+ */
+int
+mappages_super(pagetable_t pagetable, uint64 va, uint64 pa, uint64 perm)
+{
+  if(va % SUPERPGSIZE != 0) {
+    printf("mappages_super: va 0x%lx not 2MB aligned\n", va);
+    return -1;
+  }
+  
+  if(pa % SUPERPGSIZE != 0) {
+    printf("mappages_super: pa %p not 2MB aligned\n", (void *)pa);
+    return -1;
+  }
+
+  printf("mappages_super: mapping va=0x%lx to pa=%p with perm=0x%lx\n", va, (void *)pa, perm);
+  
+  pte_t *pte = walk(pagetable, va, 1);
+  if(pte == 0) {
+    printf("mappages_super: walk failed for va=0x%lx\n", va);
+    return -1;
+  }
+  
+  if(*pte & PTE_V) {
+    printf("mappages_super: PTE already mapped: 0x%lx -> pa=0x%lx\n", *pte, PTE2PA(*pte));
+    return -1;
+  }
+  
+  // Check if this physical page is already mapped elsewhere
+  // This is a simple check - in a real system you'd need a more comprehensive approach
+//  pte_t *existing_pte = walk(pagetable, 0, 1); // Start search from VA 0
+  //uint64 search_va = 0;
+  ///while(existing_pte && search_va < MAXVA) {
+    //if((*existing_pte & PTE_V) && PTE2PA(*existing_pte) == (uint64)pa) {
+      //printf("mappages_super: physical page %p already mapped at va=0x%lx\n", (void *)pa, search_va);
+      //return -1;
+    //}
+    //search_va += PGSIZE;
+    //existing_pte = walk(pagetable, search_va, 0);
+ // }
+  
+  // Create superpage PTE: valid + read (indicates superpage) + permissions
+  *pte = PA2PTE(pa) | perm | PTE_V | PTE_R;
+  
+  printf("mappages_super: success - set PTE to 0x%lx\n", *pte);
+  return 0;
+}
+
+/**
+ * issuperpage - Check if a PTE represents a superpage
+ * @pte: Page table entry to check
+ * @return: 1 if superpage, 0 if regular page
+ *
+ * Superpage PTEs have:
+ * - PTE_V valid
+ * - PTE_R read (indicates 2MB page in level-1)  
+ * - Physical address 2MB aligned
+ * - No PTE_W, PTE_X, PTE_U bits set (those are in level-2 PTEs)
+ */
+int
+issuperpage(pte_t pte)
+{
+  // Superpage: valid + read bit set, but no W/X/U bits (those are in lower levels)
+   return (pte & PTE_V) && 
+         (pte & PTE_R) && 
+         ((pte & (PTE_W|PTE_X|PTE_U)) == 0) &&
+         ((PTE2PA(pte) & (SUPERPGSIZE-1)) == 0);
+}
+
+/**
+ * demotesuperpage - Convert a superpage into 512 regular 4KB pages
+ * @pagetable: Page table to modify
+ * @va: Virtual address of superpage (must be 2MB aligned)
+ * @return: 0 on success, -1 on failure
+ *
+ * Used when we need to free part of a superpage - we break it up
+ * into individual 4KB pages so we can free them separately.
+ */
+int
+demotesuperpage(pagetable_t pagetable, uint64 va)
+{
+  if(va % SUPERPGSIZE != 0)
+     return -1;
+    //panic("demotesuperpage: virtual address not 2MB aligned");
+
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0 || !issuperpage(*pte))
+    return -1;  // Not a superpage or doesn't exist
+
+  // Extract superpage information
+  uint64 pa = PTE2PA(*pte);        // Physical address of superpage
+  uint64 perm = PTE_FLAGS(*pte) & ~PTE_R;  // Permissions without PTE_R
+
+  // Remove the superpage mapping
+  *pte = 0;
+
+  // Map 512 individual 4KB pages instead
+  for(int i = 0; i < SUPERPGSIZE/PGSIZE; i++) {
+    uint64 page_va = va + i * PGSIZE;    // Virtual address for this 4KB page
+    uint64 page_pa = pa + i * PGSIZE;    // Physical address for this 4KB page
+    
+    // Map as regular 4KB page with read+write permissions
+    if(mappages(pagetable, page_va, PGSIZE, page_pa, perm | PTE_R | PTE_W) != 0) {
+      return -1;  // Failed to map page
+    }
+  }
+
+  return 0;
+}

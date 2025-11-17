@@ -66,6 +66,8 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void*           superalloc(void);     
+void            superfree(void*);     
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -191,6 +193,13 @@ void            vmprint(pagetable_t);
 #ifdef LAB_PGTBL
 pte_t*          pgpte(pagetable_t, uint64);
 #endif
+void            vmprint(pagetable_t); // Our recursive page table print function
+
+//Supperpage functions
+int             cansuperpage(uint64, uint64);      
+int             mappages_super(pagetable_t, uint64, uint64, uint64); 
+int             issuperpage(pte_t);                
+int             demotesuperpage(pagetable_t, uint64);  
 
 // plic.c
 void            plicinit(void);
