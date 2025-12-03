@@ -73,17 +73,35 @@ sys_pause(void)
   argint(0, &n);
   if(n < 0)
     n = 0;
+
+  printf("pause: process %d pausing for %d ticks\n", myproc()->pid, n); // DEBUG
+
   acquire(&tickslock);
   ticks0 = ticks;
   while(ticks - ticks0 < n){
     if(killed(myproc())){
+
+
+   
+
       release(&tickslock);
+
+
       return -1;
     }
+
+
+    printf("pause: process %d calling sleep\n", myproc()->pid); // DEBUG
+
     sleep(&ticks, &tickslock);
+
+    printf("pause: process %d woke up\n", myproc()->pid); // DEBUG
   }
   release(&tickslock);
-  return 0;
+
+  printf("pause: process %d finished pausing\n", myproc()->pid); // DEBUG
+  
+return 0;
 }
 
 uint64
@@ -106,4 +124,55 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// === MLFQ ADDITION: getprocinfo syscall ===
+uint64
+sys_getprocinfo(void)
+{
+  struct procinfo pi;
+  uint64 addr;
+  int pid;
+
+  // Get arguments (matching your style - no return value checks)
+  argint(0, &pid);
+  argaddr(1, &addr);
+
+  // Call the MLFQ function
+  if( getprocinfo(pid, &pi) < 0)
+    return -1;
+
+  // Copy result to user space
+  if(copyout(myproc()->pagetable, addr, (char*)&pi, sizeof(pi)) < 0)
+    return -1;
+
+  return 0;
+}
+
+// === MLFQ ADDITION: boostproc syscall ===
+uint64
+sys_boostproc(void)
+{
+  struct proc *p;
+  
+  // Boost all processes without global lock
+  // This is safer if your version doesn't have wait_lock
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+      p->qlevel = 0;    // Reset to highest priority
+      p->qticks = 0;    // Reset time counter
+    }
+    release(&p->lock);
+  }
+  
+  last_boost = ticks;
+  return 0;
+}
+
+uint64
+sys_yield(void)
+{
+  yield();
+  return 0;
 }

@@ -20,3 +20,6 @@
 #define SYS_link   19
 #define SYS_mkdir  20
 #define SYS_close  21
+#define SYS_getprocinfo 22   //System calls for MLFQ
+#define SYS_boostproc   23
+#define SYS_yield  24

@@ -20,6 +20,20 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+// Add near the top with other global variables
+struct proc *queues[NQ] = {0};      // Head pointers for each queue
+struct proc *queue_tails[NQ] = {0}; // Tail pointers for each queue
+int qquantum[NQ] = {1, 2, 4, 8};    // Quantum for each queue level
+int boost_interval = 200;           // Boost every 1000 ticks
+int last_boost = 0;                 // Last boost time
+
+// === MLFQ FUNCTION DECLARATIONS ===
+void enqueue_proc(int level, struct proc *p);
+struct proc* dequeue_proc(int level);
+int queue_empty(int level);
+void boost_priority(void);
+int getprocinfo(int pid, struct procinfo *pi);
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -33,7 +47,7 @@ void
 proc_mapstacks(pagetable_t kpgtbl)
 {
   struct proc *p;
-  
+
   for(p = proc; p < &proc[NPROC]; p++) {
     char *pa = kalloc();
     if(pa == 0)
@@ -48,7 +62,7 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
@@ -93,7 +107,7 @@ int
 allocpid()
 {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -145,6 +159,11 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  // MLFQ initialization
+  p->qlevel = 0;
+  p->qticks = 0;
+  p->next = 0;
 
   return p;
 }
@@ -223,12 +242,24 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
-
+  // allocproc returns with p->lock held.
+  // To safely enqueue, we must release p->lock,
+  // acquire wait_lock, then re-acquire p->lock.
   release(&p->lock);
+
+  acquire(&wait_lock);
+  acquire(&p->lock);
+  
+  p->state = RUNNABLE;
+  p->qlevel = 0;
+  p->qticks = 0;
+  enqueue_proc(0, p);
+  
+  release(&p->lock);
+  release(&wait_lock);
 }
 
 // Grow or shrink user memory by n bytes.
@@ -294,13 +325,25 @@ kfork(void)
 
   release(&np->lock);
 
+  // === MLFQ ADDITION: Safe Enqueue ===
+  // We need wait_lock to manipulate the process tree and queues safely
   acquire(&wait_lock);
+  
   np->parent = p;
-  release(&wait_lock);
-
+  
+  // Acquire child lock to change state
   acquire(&np->lock);
   np->state = RUNNABLE;
+  
+  // Initialize MLFQ stats
+  np->qlevel = 0;
+  np->qticks = 0;
+  
+  // Safe to enqueue because we hold wait_lock
+  enqueue_proc(np->qlevel, np);
+  
   release(&np->lock);
+  release(&wait_lock);
 
   return pid;
 }
@@ -352,7 +395,7 @@ kexit(int status)
 
   // Parent might be sleeping in wait().
   wakeup(p->parent);
-  
+
   acquire(&p->lock);
 
   p->xstate = status;
@@ -408,67 +451,133 @@ kwait(uint64 addr)
       release(&wait_lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
 }
 
 // Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
 void
 scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  int level;
 
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
-    intr_off();
+
+    // 1. Priority Boosting (Starvation prevention)
+    if(ticks - last_boost >= boost_interval) {
+      printf("DEBUG: global_ticks reached %d, calling boost\n", boost_interval);
+      boost_priority();
+      last_boost = ticks;
+    }
 
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    // 2. MLFQ Queue Scan
+    acquire(&wait_lock); 
+    for(level = 0; level < NQ; level++) {
+      while(!queue_empty(level)) {
+        p = dequeue_proc(level);
+        
+        // Lock process to check state
+        acquire(&p->lock);
+
+        if(p->state == RUNNABLE) {
+          p->state = RUNNING;
+          c->proc = p;
+          
+          // Release global lock before switching context
+          release(&wait_lock);
+          
+          swtch(&c->context, &p->context);
+          
+          // === RETURN FROM PROCESS ===
+          c->proc = 0;
+
+          // CRITICAL FIX: Lock Ordering
+          // We currently hold p->lock (from yield/sched).
+          // We CANNOT acquire wait_lock yet because wait_lock > p->lock.
+          
+          // 1. Release p->lock so we can grab wait_lock safely.
+          release(&p->lock);
+          
+          // 2. Acquire wait_lock (Global Queue Lock)
+          acquire(&wait_lock);
+          
+          // 3. Re-acquire p->lock to verify state and enqueue
+          acquire(&p->lock);
+          
+          // Check if process is still RUNNABLE (it might have yielded)
+          if(p->state == RUNNABLE) {
+             enqueue_proc(p->qlevel, p);
+          }
+          
+          release(&p->lock);
+          // We still hold wait_lock here, ready for next loop iteration
+          
+          found = 1;
+          break; // Break inner loop to restart priority scan from top (level 0)
+        } 
+        else {
+          // Process wasn't runnable (changed state), just release
+          release(&p->lock);
+        }
       }
-      release(&p->lock);
+      if(found) break; // If we ran a process, restart scan from highest priority
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+    release(&wait_lock);
+
+    // 3. Emergency Fallback
+    // This catches processes that were made RUNNABLE by wakeup/kill
+    // but were not added to the queue to avoid lock panics.
+    if(!found) {
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          // Found a stray runnable process
+          p->state = RUNNING;
+          c->proc = p;
+          
+          swtch(&c->context, &p->context);
+          
+          c->proc = 0;
+          
+          // It returned. We must enqueue it now if it's still RUNNABLE.
+          if(p->state == RUNNABLE) {
+            // Apply safe lock ordering: release p -> get wait -> get p
+            release(&p->lock); 
+            
+            acquire(&wait_lock);
+            acquire(&p->lock);
+            
+            if(p->state == RUNNABLE) {
+              enqueue_proc(p->qlevel, p);
+            }
+            
+            release(&wait_lock);
+            // We hold p->lock, but the loop continues with p increment
+            // We can release it here to be safe
+          }
+          found = 1;
+        }
+        release(&p->lock);
+      }
+      
+      if(!found) {
+        intr_on();
+        asm volatile("wfi");
+      }
     }
   }
 }
 
 // Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
+// and have changed proc->state.
 void
 sched(void)
 {
@@ -495,7 +604,12 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+
+  // Note: We do NOT promote or enqueue here.
+  // We simply set state to RUNNABLE.
+  // The scheduler loop will handle re-enqueueing upon return.
   p->state = RUNNABLE;
+  
   sched();
   release(&p->lock);
 }
@@ -513,24 +627,15 @@ forkret(void)
   release(&p->lock);
 
   if (first) {
-    // File system initialization must be run in the context of a
-    // regular process (e.g., because it calls sleep), and thus cannot
-    // be run from main().
     fsinit(ROOTDEV);
-
     first = 0;
-    // ensure other cores see first=0.
     __sync_synchronize();
-
-    // We can invoke kexec() now that file system is initialized.
-    // Put the return value (argc) of kexec into a0.
     p->trapframe->a0 = kexec("/init", (char *[]){ "/init", 0 });
     if (p->trapframe->a0 == -1) {
       panic("exec");
     }
   }
 
-  // return to user space, mimicing usertrap()'s return.
   prepare_return();
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
@@ -538,38 +643,28 @@ forkret(void)
 }
 
 // Sleep on channel chan, releasing condition lock lk.
-// Re-acquires lk when awakened.
 void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
-  // Must acquire p->lock in order to
-  // change p->state and then call sched.
-  // Once we hold p->lock, we can be
-  // guaranteed that we won't miss any wakeup
-  // (wakeup locks p->lock),
-  // so it's okay to release lk.
 
-  acquire(&p->lock);  //DOC: sleeplock1
+  acquire(&p->lock);
   release(lk);
 
-  // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
 
+  p->qticks = 0;
+
   sched();
 
-  // Tidy up.
   p->chan = 0;
 
-  // Reacquire original lock.
   release(&p->lock);
   acquire(lk);
 }
 
 // Wake up all processes sleeping on channel chan.
-// Caller should hold the condition lock.
 void
 wakeup(void *chan)
 {
@@ -580,6 +675,9 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        // DO NOT ENQUEUE HERE.
+        // We let the scheduler "fallback" find this process.
+        // This avoids the panic: acquire error (recursive locks).
       }
       release(&p->lock);
     }
@@ -587,8 +685,6 @@ wakeup(void *chan)
 }
 
 // Kill the process with the given pid.
-// The victim won't exit until it tries to return
-// to user space (see usertrap() in trap.c).
 int
 kkill(int pid)
 {
@@ -599,8 +695,9 @@ kkill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
-        // Wake process from sleep().
         p->state = RUNNABLE;
+        // DO NOT ENQUEUE HERE.
+        // Relies on scheduler fallback to avoid lock ordering panic.
       }
       release(&p->lock);
       return 0;
@@ -622,16 +719,13 @@ int
 killed(struct proc *p)
 {
   int k;
-  
+
   acquire(&p->lock);
   k = p->killed;
   release(&p->lock);
   return k;
 }
 
-// Copy to either a user address, or kernel address,
-// depending on usr_dst.
-// Returns 0 on success, -1 on error.
 int
 either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
 {
@@ -644,9 +738,6 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
   }
 }
 
-// Copy from either a user address, or kernel address,
-// depending on usr_src.
-// Returns 0 on success, -1 on error.
 int
 either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 {
@@ -659,9 +750,6 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   }
 }
 
-// Print a process listing to console.  For debugging.
-// Runs when user types ^P on console.
-// No lock to avoid wedging a stuck machine further.
 void
 procdump(void)
 {
@@ -687,4 +775,99 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// Queue operations
+void
+enqueue_proc(int level, struct proc *p)
+{
+  p->next = 0;
+  if (!queues[level]) {
+    queues[level] = p;
+    queue_tails[level] = p;
+  } else {
+    queue_tails[level]->next = p;
+    queue_tails[level] = p;
+  }
+}
+
+struct proc*
+dequeue_proc(int level)
+{
+  struct proc *p = queues[level];
+  if (!p) return 0;
+
+  queues[level] = p->next;
+  if (!queues[level])
+    queue_tails[level] = 0;
+
+  p->next = 0;
+  return p;
+}
+
+int
+queue_empty(int level)
+{
+  return queues[level] == 0;
+}
+
+void
+boost_priority(void)
+{
+  struct proc *p;
+  int count = 0;
+
+  // We must acquire wait_lock to manipulate queues safely
+  acquire(&wait_lock); 
+  
+  // Clear all queues first
+  for(int i = 0; i < NQ; i++) {
+     queues[i] = 0;
+     queue_tails[i] = 0;
+  }
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+
+    // Count only Used processes that are getting boosted
+    if(p->state != UNUSED && p->qlevel > 0) {
+        count++;
+    }
+    if(p->state == RUNNABLE || p->state == RUNNING) {
+      p->qlevel = 0;
+      p->qticks = 0;
+      // If it's runnable, we must re-add it to the top queue
+      // If it's running, it will be added when it yields
+      if(p->state == RUNNABLE) {
+        enqueue_proc(0, p);
+      }
+    }
+    release(&p->lock);
+  }
+  
+  release(&wait_lock);
+printf(">>>>>> BOOST: Reset %d processes to priority 0 (global_ticks=0) <<<<<<\n", count);
+}
+
+int
+getprocinfo(int pid, struct procinfo *pi)
+{
+  struct proc *p;
+  int found = 0;
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED) {
+      pi->pid = p->pid;
+      pi->state = p->state;
+      pi->qlevel = p->qlevel;
+      pi->qticks = p->qticks;
+      safestrcpy(pi->name, p->name, sizeof(pi->name));
+      release(&p->lock);
+      found = 1;
+      return 0;
+    }
+    release(&p->lock);
+    if(found) return 0;
+  }
+  return -1;
 }

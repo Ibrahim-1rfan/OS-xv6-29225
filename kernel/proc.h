@@ -1,3 +1,8 @@
+#define NQ 4           // Number of queues
+extern int qquantum[NQ]; // Quantum for each queue
+
+
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -104,4 +109,39 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+
+
+  // MLFQ fields
+  int qlevel;          // Current queue level (0-3)
+  int qticks;          // Ticks used at current level
+  struct proc *next;   // For linked list in queues
+
+
 };
+
+// Add procinfo struct for syscall
+struct procinfo {
+  int pid;
+  int state;
+  int qlevel;
+  int qticks;
+  char name[16];
+};
+
+// === EXTERNAL DECLARATIONS - THESE ARE CRITICAL ===
+extern struct proc proc[NPROC];          // Process table
+extern int last_boost;                   // Last boost time
+
+// MLFQ global variables
+extern struct proc *queues[NQ];
+extern struct proc *queue_tails[NQ];
+extern int qquantum[NQ];
+extern int boost_interval;
+
+// MLFQ function declarations
+void enqueue_proc(int level, struct proc *p);
+struct proc* dequeue_proc(int level);
+int queue_empty(int level);
+void boost_priority(void);
+int getprocinfo(int pid, struct procinfo *pi);

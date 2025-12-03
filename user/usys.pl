@@ -42,3 +42,7 @@ entry("getpid");
 entry("sbrk");
 entry("pause");
 entry("uptime");
+#MLFQ syscalls
+entry("getprocinfo");  
+entry("boostproc");   
+entry("yield");
